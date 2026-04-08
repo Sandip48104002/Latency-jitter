@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+env/
+.env
+
+# IDE/editor files
+.vscode/
+.idea/
+
+# Generated experiment outputs
+data/*.csv
+
+# Local datasets and binary traces
+*.dat
+*.bin
