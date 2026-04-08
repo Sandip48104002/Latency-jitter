@@ -3,64 +3,72 @@ sketch.py
 ─────────
 Memory-efficient jitter detector using a count-min-style sketch.
 
-Architecture
-────────────
-  • Fixed total memory  : TOTAL_MEMORY_BYTES (default 400 KB)
-  • Rows                : NUM_ROWS (default 4)
-  • Each bucket stores  : 2-byte fingerprint  +  4-byte EWMA (float32)
-                          +  2-byte packet count (uint16)  = 8 bytes
-  • Buckets per row     : TOTAL_MEMORY_BYTES // (NUM_ROWS * BUCKET_SIZE)
+TWO VARIANTS are implemented in this file side-by-side for easy comparison:
 
-Per-packet processing
-─────────────────────
-  1. Compute 5-tuple flow key.
-  2. Hash flow key with BobHash once per row (with a per-row seed).
-  3. Derive a 16-bit fingerprint from the flow key (independent hash).
-  4. For each row:
-       a. Look up bucket at hashed index.
-       b. If fingerprint matches → "HIT"
-             - read stored EWMA
-             - detect jitter: latency > K*ewma or latency < ewma/K
-             - update EWMA in bucket
-       c. Else → "MISS"
-             - if bucket is empty (fingerprint == 0) → insert
-             - else → eviction policy (LRU-approximation via packet count)
-  5. A packet is flagged as jitter only if ALL rows that see a fingerprint
-     match agree (conservative) — OR if ANY row flags it (aggressive).
-     We use ANY-row strategy here (higher recall).
+  ┌─────────────────────┬──────────────────────────────────────────────────┐
+  │  JitterSketch       │  WITH fingerprint (original)                     │
+  │                     │  Bucket = fingerprint(2B) + ewma(8B) + count(2B) │
+  │                     │  = 12 B/bucket → 8,533 buckets/row @ 400 KB      │
+  │                     │  Has HIT / MISS logic + eviction policy          │
+  ├─────────────────────┼──────────────────────────────────────────────────┤
+  │  JitterSketchNoFP   │  WITHOUT fingerprint (new, this change)          │
+  │                     │  Bucket = ewma(8B) + count(2B) = 10 B/bucket     │
+  │                     │  → 10,240 buckets/row @ 400 KB                   │
+  │                     │  Every hash always hits its bucket (no eviction) │
+  │                     │  Hash collisions silently corrupt EWMA            │
+  └─────────────────────┴──────────────────────────────────────────────────┘
+
+Without fingerprint:
+  • No HIT/MISS distinction – every packet unconditionally reads and writes
+    the bucket it hashes to.
+  • No eviction needed – the bucket is always "used" by whoever hashes there.
+  • Collision effect: two different flows that map to the same bucket will
+    mix their EWMA values, producing spurious jitter or masking real jitter.
+    This is the core accuracy cost of dropping the fingerprint guard.
+  • Benefit: ~20% more buckets for the same memory (10 B vs 12 B per bucket),
+    slightly lower collision probability, and simpler/faster per-packet logic.
 
 BobHash
 ───────
 A pure-Python implementation of Bob Jenkins' lookup3 hashlittle2.
-We use 32-bit output per call, seeded differently per row.
+32-bit output, seeded independently per row.
 """
 
-import struct
-import math
 import array
-from typing import NamedTuple
 
-# ── sketch parameters ─────────────────────────────────────────────────────────
-TOTAL_MEMORY_BYTES = 400 * 1024    # 400 KB
+# ── shared sketch parameters ──────────────────────────────────────────────────
+TOTAL_MEMORY_BYTES = 400 * 1024    # 400 KB hard budget
+
 NUM_ROWS           = 4
-BUCKET_SIZE        = 8             # bytes: 2 fp + 4 ewma_f32 + 2 pkt_count
 
-BUCKETS_PER_ROW    = TOTAL_MEMORY_BYTES // (NUM_ROWS * BUCKET_SIZE)
+# Per-row BobHash seeds (arbitrary distinct constants)
+ROW_SEEDS = [0xDEADBEEF, 0xCAFEBABE, 0x8BADF00D, 0xFEEDFACE]
 
-# EWMA / jitter thresholds (should match ground_truth.py for fair comparison)
+# Fingerprint seed – must differ from all row seeds (used only by JitterSketch)
+FP_SEED = 0xABADCAFE
+
+# EWMA / jitter thresholds – must match ground_truth.py for fair comparison
 ALPHA = 0.125
 K     = 2.0
 
-# Per-row BobHash seeds (arbitrary distinct primes)
-ROW_SEEDS = [0xDEADBEEF, 0xCAFEBABE, 0x8BADF00D, 0xFEEDFACE]
-# Fingerprint seed (must differ from row seeds)
-FP_SEED   = 0xABADCAFE
+# ── bucket sizes and derived bucket counts ────────────────────────────────────
+#
+#  WITH fingerprint:    fp(2B) + ewma(8B) + count(2B) = 12 bytes / bucket
+#  WITHOUT fingerprint:          ewma(8B) + count(2B) = 10 bytes / bucket
+#
+_BUCKET_SIZE_FP   = 12
+_BUCKET_SIZE_NOFP = 10
+
+BUCKETS_PER_ROW_FP   = TOTAL_MEMORY_BYTES // (NUM_ROWS * _BUCKET_SIZE_FP)
+BUCKETS_PER_ROW_NOFP = TOTAL_MEMORY_BYTES // (NUM_ROWS * _BUCKET_SIZE_NOFP)
+
+# Keep legacy name for backward-compat with main.py import
+BUCKETS_PER_ROW = BUCKETS_PER_ROW_FP
 
 
-# ── Bob Jenkins lookup3 hashlittle (32-bit output) ────────────────────────────
+# ── Bob Jenkins lookup3 hashlittle (32-bit) ───────────────────────────────────
 
 def _rot32(val: int, shift: int) -> int:
-    """Rotate a 32-bit integer left by shift bits."""
     val &= 0xFFFFFFFF
     return ((val << shift) | (val >> (32 - shift))) & 0xFFFFFFFF
 
@@ -69,43 +77,30 @@ def bob_hash(data: bytes, seed: int = 0) -> int:
     """
     Pure-Python Bob Jenkins lookup3 hashlittle.
     Returns a 32-bit unsigned integer.
-
-    This is a faithful implementation of Jenkins' lookup3 hashlittle2
-    reduced to a single 32-bit output (the 'c' word).
     """
-    MASK = 0xFFFFFFFF
+    MASK   = 0xFFFFFFFF
     length = len(data)
-
-    # Initialise three 32-bit words
     a = b = c = (0xDEADBEEF + length + seed) & MASK
 
     i = 0
     while length > 12:
-        a = (a + int.from_bytes(data[i:i+4],   "little")) & MASK
-        b = (b + int.from_bytes(data[i+4:i+8], "little")) & MASK
-        c = (c + int.from_bytes(data[i+8:i+12],"little")) & MASK
-
+        a = (a + int.from_bytes(data[i:i+4],    "little")) & MASK
+        b = (b + int.from_bytes(data[i+4:i+8],  "little")) & MASK
+        c = (c + int.from_bytes(data[i+8:i+12], "little")) & MASK
         # mix
-        a = (_rot32(a ^ c, 4)  - c) & MASK; c = _rot32(c,  5)
-        b = (_rot32(b ^ a, 6)  - a) & MASK; a = _rot32(a, 11)
-        c = (_rot32(c ^ b, 8)  - b) & MASK; b = _rot32(b, 13)
+        a = (_rot32(a ^ c,  4) - c) & MASK; c = _rot32(c,  5)
+        b = (_rot32(b ^ a,  6) - a) & MASK; a = _rot32(a, 11)
+        c = (_rot32(c ^ b,  8) - b) & MASK; b = _rot32(b, 13)
         a = (_rot32(a ^ c, 14) - c) & MASK; c = _rot32(c, 11)
         b = (_rot32(b ^ a, 11) - a) & MASK; a = _rot32(a, 25)
-
         i      += 12
         length -= 12
 
-    # Handle remaining bytes (0-12)
-    tail = data[i:]
-    tl   = len(tail)
-    # Pad tail with zeros to 12 bytes for simpler handling
-    tail = tail + b'\x00' * (12 - tl)
-
+    tail = data[i:] + b'\x00' * (12 - len(data[i:]))
     a = (a + int.from_bytes(tail[0:4],  "little")) & MASK
     b = (b + int.from_bytes(tail[4:8],  "little")) & MASK
     c = (c + int.from_bytes(tail[8:12], "little")) & MASK
-
-    # Final mix
+    # final mix
     c ^= b; c = (c - _rot32(b, 14)) & MASK
     a ^= c; a = (a - _rot32(c, 11)) & MASK
     b ^= a; b = (b - _rot32(a, 25)) & MASK
@@ -113,176 +108,143 @@ def bob_hash(data: bytes, seed: int = 0) -> int:
     a ^= c; a = (a - _rot32(c,  4)) & MASK
     b ^= a; b = (b - _rot32(a, 14)) & MASK
     c ^= b; c = (c - _rot32(b, 24)) & MASK
-
     return c & MASK
 
 
 def flow_key_bytes(flow_id: str) -> bytes:
-    """Encode the flow_id string as UTF-8 bytes for hashing."""
+    """Encode the 5-tuple flow_id string as UTF-8 bytes for hashing."""
     return flow_id.encode("utf-8")
 
 
-# ── Sketch data structure ─────────────────────────────────────────────────────
-
-class Bucket(NamedTuple):
-    """
-    In-memory representation of one sketch bucket.
-    Stored in three parallel arrays (fingerprints, ewma, pkt_counts)
-    for cache efficiency.
-    """
-    pass   # We use parallel arrays below, not a per-bucket object.
-
+# ═════════════════════════════════════════════════════════════════════════════
+#  VARIANT 1 – WITH fingerprint  (original behaviour, unchanged)
+# ═════════════════════════════════════════════════════════════════════════════
 
 class JitterSketch:
     """
-    4-row sketch with BobHash, 16-bit fingerprints, and EWMA per bucket.
+    4-row sketch WITH 16-bit fingerprints.
 
-    Memory layout (per row):
-        fingerprints[BUCKETS_PER_ROW]  : array of uint16
-        ewma[BUCKETS_PER_ROW]          : array of float  (Python float = 64-bit,
-                                          logically we treat it as float32)
-        pkt_count[BUCKETS_PER_ROW]     : array of uint16 (for eviction)
+    Bucket layout per row (12 bytes each):
+        fingerprints[bpr]  : uint16  – identifies which flow owns the bucket
+        ewma_vals[bpr]     : float64 – EWMA latency for that flow
+        pkt_counts[bpr]    : uint16  – packets seen (used for eviction & seeding)
+
+    Per-packet logic:
+        1. Hash flow key → bucket index (per row, different seed each row).
+        2. Compute 16-bit fingerprint (single seed, row-independent).
+        3. If stored fingerprint matches → HIT: detect jitter, update EWMA.
+           If stored fingerprint is 0   → EMPTY: insert this flow.
+           Else                         → COLLISION: evict if occupant count ≤ 2.
+        4. Flag jitter if ANY matched row voted jitter.
+           If no row matched → no decision (miss).
     """
 
     def __init__(self,
-                 num_rows: int          = NUM_ROWS,
-                 buckets_per_row: int   = BUCKETS_PER_ROW,
-                 alpha: float           = ALPHA,
-                 k: float               = K,
-                 row_seeds: list[int]   = None,
-                 fp_seed: int           = FP_SEED):
+                 num_rows: int        = NUM_ROWS,
+                 buckets_per_row: int = BUCKETS_PER_ROW_FP,
+                 alpha: float         = ALPHA,
+                 k: float             = K,
+                 row_seeds            = None,
+                 fp_seed: int         = FP_SEED):
 
-        self.num_rows       = num_rows
-        self.bpr            = buckets_per_row   # buckets per row
-        self.alpha          = alpha
-        self.k              = k
-        self.row_seeds      = row_seeds or ROW_SEEDS[:num_rows]
-        self.fp_seed        = fp_seed
+        self.num_rows  = num_rows
+        self.bpr       = buckets_per_row
+        self.alpha     = alpha
+        self.k         = k
+        self.row_seeds = row_seeds or ROW_SEEDS[:num_rows]
+        self.fp_seed   = fp_seed
 
-        # Parallel arrays – one list of arrays per row
-        # 'H' = unsigned short (uint16), 'd' = double
-        self.fingerprints = [array.array('H', [0] * self.bpr) for _ in range(num_rows)]
+        # Parallel arrays per row  ('H'=uint16, 'd'=float64)
+        self.fingerprints = [array.array('H', [0]   * self.bpr) for _ in range(num_rows)]
         self.ewma_vals    = [array.array('d', [0.0] * self.bpr) for _ in range(num_rows)]
-        self.pkt_counts   = [array.array('H', [0] * self.bpr) for _ in range(num_rows)]
+        self.pkt_counts   = [array.array('H', [0]   * self.bpr) for _ in range(num_rows)]
 
-        # Statistics counters
-        self.total_pkts  = 0
-        self.hit_count   = 0   # packets where at least one row fingerprint matched
-        self.miss_count  = 0
-        self.evictions   = 0
+        # Runtime counters
+        self.total_pkts = 0
+        self.hit_count  = 0   # pkts where ≥1 row had a fingerprint match
+        self.miss_count = 0   # pkts where 0 rows matched
+        self.evictions  = 0
 
-    # ── internal helpers ──────────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
 
     def _bucket_index(self, key_bytes: bytes, row: int) -> int:
-        """Hash flow key to a bucket index in the given row."""
-        h = bob_hash(key_bytes, seed=self.row_seeds[row])
-        return h % self.bpr
+        return bob_hash(key_bytes, seed=self.row_seeds[row]) % self.bpr
 
     def _fingerprint(self, key_bytes: bytes) -> int:
-        """Compute 16-bit fingerprint from flow key (row-independent)."""
-        h = bob_hash(key_bytes, seed=self.fp_seed)
-        fp = (h >> 16) ^ (h & 0xFFFF)    # fold 32 bits to 16
-        return fp if fp != 0 else 1       # 0 is reserved for "empty"
+        """16-bit fingerprint; 0 is reserved for 'empty bucket'."""
+        h  = bob_hash(key_bytes, seed=self.fp_seed)
+        fp = (h >> 16) ^ (h & 0xFFFF)
+        return fp if fp != 0 else 1
 
-    def _update_ewma(self, current: float, new_sample: float) -> float:
-        """One step of exponential weighted moving average."""
-        return self.alpha * new_sample + (1 - self.alpha) * current
+    def _ewma_step(self, current: float, sample: float) -> float:
+        return self.alpha * sample + (1 - self.alpha) * current
 
-    # ── public API ────────────────────────────────────────────────────────────
+    # ── main API ──────────────────────────────────────────────────────────────
 
     def process_packet(self, flow_id: str, latency: float) -> int:
         """
-        Feed one packet into the sketch.
+        Process one packet. Returns 1 if jitter detected, 0 otherwise.
 
-        Returns
-        -------
-        1 if jitter is detected, 0 otherwise.
-
-        Logic
-        ─────
-        For each row:
-          • Compute bucket index and fingerprint.
-          • If fingerprint matches stored value → UPDATE path
-              - compare latency vs stored EWMA → jitter decision
-              - update EWMA
-          • Else → MISS path
-              - empty bucket  → insert
-              - occupied      → eviction: replace if current count is LOW
-                                (count-based approximate LRU)
-        A packet is flagged as jitter if ANY row (that has a FP match)
-        detects jitter. If no row has a match, no jitter is declared.
+        Fingerprint match  → read EWMA → jitter check → update EWMA.
+        Empty bucket       → insert (seed EWMA = latency, count = 1).
+        Occupied (no match)→ evict if occupant count ≤ 2, else skip row.
         """
         self.total_pkts += 1
-        key_bytes   = flow_key_bytes(flow_id)
-        fp          = self._fingerprint(key_bytes)
+        key   = flow_key_bytes(flow_id)
+        fp    = self._fingerprint(key)
 
-        jitter_votes  = 0    # rows that voted "jitter"
-        match_votes   = 0    # rows that had a fingerprint match
+        jitter_votes = 0
+        match_votes  = 0
 
         for row in range(self.num_rows):
-            idx = self._bucket_index(key_bytes, row)
+            idx = self._bucket_index(key, row)
 
             stored_fp    = self.fingerprints[row][idx]
             stored_ewma  = self.ewma_vals[row][idx]
             stored_count = self.pkt_counts[row][idx]
 
             if stored_fp == fp:
-                # ── HIT: fingerprint matches ──────────────────────────────────
+                # ── HIT ──────────────────────────────────────────────────────
                 match_votes += 1
-                if stored_count >= 1:       # have at least one prior EWMA update
-                    # jitter detection BEFORE updating EWMA
+                if stored_count >= 1:
+                    # Jitter check against EWMA BEFORE updating it
                     if latency > self.k * stored_ewma or latency < stored_ewma / self.k:
                         jitter_votes += 1
+                # Update EWMA
+                new_ewma = latency if stored_count == 0 else self._ewma_step(stored_ewma, latency)
+                self.ewma_vals[row][idx]  = new_ewma
+                self.pkt_counts[row][idx] = min(stored_count + 1, 65535)
 
-                # update EWMA in bucket
-                if stored_count == 0:
-                    new_ewma = latency       # seed EWMA with first observation
-                else:
-                    new_ewma = self._update_ewma(stored_ewma, latency)
-
-                self.ewma_vals[row][idx]   = new_ewma
-                # Cap count at uint16 max to avoid overflow
-                self.pkt_counts[row][idx]  = min(stored_count + 1, 65535)
+            elif stored_fp == 0:
+                # ── EMPTY – insert ────────────────────────────────────────────
+                self.fingerprints[row][idx] = fp
+                self.ewma_vals[row][idx]    = latency
+                self.pkt_counts[row][idx]   = 1
 
             else:
-                # ── MISS: fingerprint does not match ──────────────────────────
-                if stored_fp == 0:
-                    # Bucket is empty → insert this flow
+                # ── COLLISION – evict cold occupant ──────────────────────────
+                # Replace the existing entry only if it has been seen very few
+                # times (≤2), meaning it is likely a short-lived / dying flow.
+                if stored_count <= 2:
                     self.fingerprints[row][idx] = fp
-                    self.ewma_vals[row][idx]    = latency   # seed EWMA
+                    self.ewma_vals[row][idx]    = latency
                     self.pkt_counts[row][idx]   = 1
-                else:
-                    # Bucket occupied by a different flow.
-                    # Eviction policy: replace if the occupant has a very low
-                    # packet count (likely a cold/dying flow).
-                    # Threshold = 2 means we evict entries seen ≤ 2 times.
-                    EVICT_THRESHOLD = 2
-                    if stored_count <= EVICT_THRESHOLD:
-                        self.fingerprints[row][idx] = fp
-                        self.ewma_vals[row][idx]    = latency
-                        self.pkt_counts[row][idx]   = 1
-                        self.evictions += 1
-                    # else: keep existing entry, this packet is untracked in row
+                    self.evictions += 1
+                # else: keep existing entry; this packet is untracked in row
 
-        # ── aggregate decision ────────────────────────────────────────────────
         if match_votes > 0:
             self.hit_count += 1
-            # Flag as jitter if at least one matching row says jitter
             return 1 if jitter_votes > 0 else 0
         else:
             self.miss_count += 1
-            return 0   # no match → cannot make a decision
+            return 0   # no match in any row → no decision possible
 
     def memory_bytes(self) -> int:
-        """Actual memory used by sketch arrays in bytes."""
-        fp_mem    = self.num_rows * self.bpr * 2     # uint16
-        ewma_mem  = self.num_rows * self.bpr * 8     # float64 (Python)
-        cnt_mem   = self.num_rows * self.bpr * 2     # uint16
-        return fp_mem + ewma_mem + cnt_mem
+        return self.num_rows * self.bpr * _BUCKET_SIZE_FP
 
     def stats(self) -> dict:
-        """Return a summary dict of sketch runtime statistics."""
         return {
+            "variant":       "with_fingerprint",
             "total_pkts":    self.total_pkts,
             "hit_count":     self.hit_count,
             "miss_count":    self.miss_count,
@@ -291,4 +253,121 @@ class JitterSketch:
             "buckets_per_row": self.bpr,
             "num_rows":      self.num_rows,
             "memory_KB":     round(self.memory_bytes() / 1024, 1),
+        }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  VARIANT 2 – WITHOUT fingerprint  (new, this change)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class JitterSketchNoFP:
+    """
+    4-row sketch WITHOUT fingerprints — EWMA-only buckets.
+
+    Bucket layout per row (10 bytes each):
+        ewma_vals[bpr]   : float64 – EWMA latency stored at hashed index
+        pkt_counts[bpr]  : uint16  – packets seen at this bucket
+
+    Key differences vs JitterSketch:
+    ─────────────────────────────────
+    • No fingerprint array → bucket = 10 B instead of 12 B
+      → 10,240 buckets/row vs 8,533 (20% more) at same 400 KB.
+    • No HIT/MISS: every packet ALWAYS reads and writes its hashed bucket.
+      There is no way to tell whether the stored EWMA belongs to this flow
+      or to a different flow that hashes to the same bucket (hash collision).
+    • No eviction: unnecessary because there is no ownership concept.
+    • Collision effect: when two flows share a bucket their EWMA values
+      mix, which can create false jitter alerts or suppress real ones.
+      The accuracy impact compared to JitterSketch shows the value of the
+      fingerprint guard.
+    • All rows always produce a jitter vote (count ≥ 1 check still applies
+      for the very first packet at a bucket, to avoid comparing against 0).
+    """
+
+    def __init__(self,
+                 num_rows: int        = NUM_ROWS,
+                 buckets_per_row: int = BUCKETS_PER_ROW_NOFP,
+                 alpha: float         = ALPHA,
+                 k: float             = K,
+                 row_seeds            = None):
+
+        self.num_rows  = num_rows
+        self.bpr       = buckets_per_row
+        self.alpha     = alpha
+        self.k         = k
+        self.row_seeds = row_seeds or ROW_SEEDS[:num_rows]
+
+        # Only two arrays per row – no fingerprint storage at all
+        self.ewma_vals  = [array.array('d', [0.0] * self.bpr) for _ in range(num_rows)]
+        self.pkt_counts = [array.array('H', [0]   * self.bpr) for _ in range(num_rows)]
+
+        # Runtime counters
+        self.total_pkts   = 0
+        self.jitter_count = 0   # total jitter decisions across all packets
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _bucket_index(self, key_bytes: bytes, row: int) -> int:
+        return bob_hash(key_bytes, seed=self.row_seeds[row]) % self.bpr
+
+    def _ewma_step(self, current: float, sample: float) -> float:
+        return self.alpha * sample + (1 - self.alpha) * current
+
+    # ── main API ──────────────────────────────────────────────────────────────
+
+    def process_packet(self, flow_id: str, latency: float) -> int:
+        """
+        Process one packet. Returns 1 if jitter detected, 0 otherwise.
+
+        No fingerprint check — every packet unconditionally reads the EWMA
+        stored at its hashed bucket index, makes a jitter decision, and
+        updates the EWMA.
+
+        Jitter is flagged if ANY row votes jitter.
+        A row can only vote once it has seen ≥1 prior packet (count ≥ 1),
+        to avoid comparing the very first latency sample against 0.
+        """
+        self.total_pkts += 1
+        key = flow_key_bytes(flow_id)
+
+        jitter_votes = 0
+
+        for row in range(self.num_rows):
+            idx = self._bucket_index(key, row)
+
+            stored_ewma  = self.ewma_vals[row][idx]
+            stored_count = self.pkt_counts[row][idx]
+
+            # ── jitter detection (before EWMA update) ────────────────────────
+            # Only test once the bucket has at least one prior sample.
+            # Note: this bucket may belong to a DIFFERENT flow (collision),
+            # which is exactly the accuracy cost being measured here.
+            if stored_count >= 1:
+                if latency > self.k * stored_ewma or latency < stored_ewma / self.k:
+                    jitter_votes += 1
+
+            # ── unconditional EWMA update ─────────────────────────────────────
+            if stored_count == 0:
+                new_ewma = latency          # seed: first sample at this bucket
+            else:
+                new_ewma = self._ewma_step(stored_ewma, latency)
+
+            self.ewma_vals[row][idx]  = new_ewma
+            self.pkt_counts[row][idx] = min(stored_count + 1, 65535)
+
+        is_jitter = 1 if jitter_votes > 0 else 0
+        self.jitter_count += is_jitter
+        return is_jitter
+
+    def memory_bytes(self) -> int:
+        return self.num_rows * self.bpr * _BUCKET_SIZE_NOFP
+
+    def stats(self) -> dict:
+        return {
+            "variant":         "no_fingerprint",
+            "total_pkts":      self.total_pkts,
+            "jitter_detected": self.jitter_count,
+            "buckets_per_row": self.bpr,
+            "num_rows":        self.num_rows,
+            "memory_KB":       round(self.memory_bytes() / 1024, 1),
         }
