@@ -38,7 +38,7 @@ import array
 import mmh3
 
 # ── shared sketch parameters ──────────────────────────────────────────────────
-TOTAL_MEMORY_BYTES = 700 * 1024    # 400 KB hard budget
+TOTAL_MEMORY_BYTES = 100 * 1024    # 400 KB hard budget
 
 NUM_ROWS           = 4
 
@@ -50,7 +50,7 @@ FP_SEED = 0xABADCAFE
 
 # EWMA / jitter thresholds – must match ground_truth.py for fair comparison
 ALPHA = 0.125
-K     = 2.0
+K     = 4.0
 
 # ── bucket sizes and derived bucket counts ────────────────────────────────────
 #
@@ -151,14 +151,12 @@ class JitterSketch:
         """
         Process one packet. Returns 1 if jitter detected, 0 otherwise.
 
-        A 2-pass approach is used:
-        1. HIT: Check all rows for a fingerprint match. If any exist, they are
-           all updated, and any empty candidate buckets are filled. A jitter
-           decision is made if at least one row matched.
-        2. MISS: If no row had a matching fingerprint, the packet is a miss.
-           The flow is inserted into an empty bucket if available. If all
-           candidate buckets are occupied, it evicts the one with the
-           lowest packet count across all rows. No jitter decision on a miss.
+        A single-bucket policy is used across the hashed candidate rows:
+        1. HIT: Use only the first row whose fingerprint matches. Detect jitter
+           and update that one bucket.
+        2. EMPTY: If no row matches, insert into the first empty bucket.
+        3. MISS: If all candidate buckets are occupied by other flows, evict
+           the one with the lowest packet count and reset it for this flow.
         """
         self.total_pkts += 1
         key   = flow_key_bytes(flow_id)
@@ -166,75 +164,57 @@ class JitterSketch:
 
         indices = [self._bucket_index(key, row) for row in range(self.num_rows)]
 
-        # --- Pass 1: Find hits, empty slots, and collisions ---
-        hit_rows = []
-        empty_rows = []
+        first_hit_row = None
+        first_empty_row = None
         collision_rows_with_counts = []
 
         for row in range(self.num_rows):
             idx = indices[row]
             stored_fp = self.fingerprints[row][idx]
             if stored_fp == fp:
-                hit_rows.append(row)
+                if first_hit_row is None:
+                    first_hit_row = row
             elif stored_fp == 0:
-                empty_rows.append(row)
+                if first_empty_row is None:
+                    first_empty_row = row
             else:
                 count = self.pkt_counts[row][idx]
                 collision_rows_with_counts.append((row, count))
 
-        # --- Process based on findings ---
-        if hit_rows:
-            # --- HIT PATH ---
+        if first_hit_row is not None:
             self.hit_count += 1
-            jitter_votes = 0
+            idx = indices[first_hit_row]
+            stored_ewma = self.ewma_vals[first_hit_row][idx]
+            stored_count = self.pkt_counts[first_hit_row][idx]
 
-            # Update all matching rows
-            for row in hit_rows:
-                idx = indices[row]
-                stored_ewma = self.ewma_vals[row][idx]
-                stored_count = self.pkt_counts[row][idx]
+            is_jitter = 0
+            if stored_count >= 1:
+                if latency > self.k * stored_ewma or latency < stored_ewma / self.k:
+                    is_jitter = 1
 
-                if stored_count >= 1:
-                    if latency > self.k * stored_ewma or latency < stored_ewma / self.k:
-                        jitter_votes += 1
+            new_ewma = latency if stored_count == 0 else self._ewma_step(stored_ewma, latency)
+            self.ewma_vals[first_hit_row][idx] = new_ewma
+            self.pkt_counts[first_hit_row][idx] = min(stored_count + 1, 65535)
+            return is_jitter
 
-                new_ewma = latency if stored_count == 0 else self._ewma_step(stored_ewma, latency)
-                self.ewma_vals[row][idx] = new_ewma
-                self.pkt_counts[row][idx] = min(stored_count + 1, 65535)
+        self.miss_count += 1
 
-            # Fill all empty buckets
-            for row in empty_rows:
-                idx = indices[row]
-                self.fingerprints[row][idx] = fp
-                self.ewma_vals[row][idx] = latency
-                self.pkt_counts[row][idx] = 1
-
-            return 1 if jitter_votes > 0 else 0
-
-        else:
-            # --- MISS PATH ---
-            self.miss_count += 1
-
-            # Insert into an empty bucket if available (preferable to eviction)
-            if empty_rows:
-                row_to_fill = empty_rows[0]  # just pick the first one
-                idx = indices[row_to_fill]
-                self.fingerprints[row_to_fill][idx] = fp
-                self.ewma_vals[row_to_fill][idx] = latency
-                self.pkt_counts[row_to_fill][idx] = 1
-                return 0
-
-            # All candidate buckets are full. Evict the one with the lowest count.
-            if collision_rows_with_counts:
-                row_to_evict, _ = min(collision_rows_with_counts, key=lambda item: item[1])
-
-                idx = indices[row_to_evict]
-                self.fingerprints[row_to_evict][idx] = fp
-                self.ewma_vals[row_to_evict][idx] = latency
-                self.pkt_counts[row_to_evict][idx] = 1
-                self.evictions += 1
-
+        if first_empty_row is not None:
+            idx = indices[first_empty_row]
+            self.fingerprints[first_empty_row][idx] = fp
+            self.ewma_vals[first_empty_row][idx] = latency
+            self.pkt_counts[first_empty_row][idx] = 1
             return 0
+
+        if collision_rows_with_counts:
+            row_to_evict, _ = min(collision_rows_with_counts, key=lambda item: item[1])
+            idx = indices[row_to_evict]
+            self.fingerprints[row_to_evict][idx] = fp
+            self.ewma_vals[row_to_evict][idx] = latency
+            self.pkt_counts[row_to_evict][idx] = 1
+            self.evictions += 1
+
+        return 0
 
     def memory_bytes(self) -> int:
         return self.num_rows * self.bpr * _BUCKET_SIZE_FP
@@ -277,8 +257,10 @@ class JitterSketchNoFP:
       mix, which can create false jitter alerts or suppress real ones.
       The accuracy impact compared to JitterSketch shows the value of the
       fingerprint guard.
-    • All rows always produce a jitter vote (count ≥ 1 check still applies
-      for the very first packet at a bucket, to avoid comparing against 0).
+    • A row can only vote after at least 2 prior samples at that bucket,
+      matching the ground-truth warm-up rule more closely.
+    • Packet-level jitter is flagged only if at least 2 of the 4 rows vote
+      jitter, reducing over-triggering from a single noisy collision.
     """
 
     def __init__(self,
@@ -320,8 +302,8 @@ class JitterSketchNoFP:
         stored at its hashed bucket index, makes a jitter decision, and
         updates the EWMA.
 
-        Jitter is flagged if ANY row votes jitter.
-        A row can only vote once it has seen ≥1 prior packet (count ≥ 1),
+        Jitter is flagged only if all 4 rows vote jitter.
+        A row can only vote once it has seen ≥2 prior packets (count ≥ 2),
         to avoid comparing the very first latency sample against 0.
         """
         self.total_pkts += 1
@@ -339,7 +321,7 @@ class JitterSketchNoFP:
             # Only test once the bucket has at least one prior sample.
             # Note: this bucket may belong to a DIFFERENT flow (collision),
             # which is exactly the accuracy cost being measured here.
-            if stored_count >= 1:
+            if stored_count >= 2:
                 if latency > self.k * stored_ewma or latency < stored_ewma / self.k:
                     jitter_votes += 1
 
@@ -352,7 +334,7 @@ class JitterSketchNoFP:
             self.ewma_vals[row][idx]  = new_ewma
             self.pkt_counts[row][idx] = min(stored_count + 1, 65535)
 
-        is_jitter = 1 if jitter_votes > 0 else 0
+        is_jitter = 1 if jitter_votes == self.num_rows else 0
         self.jitter_count += is_jitter
         return is_jitter
 
