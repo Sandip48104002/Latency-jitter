@@ -31,7 +31,8 @@ latency_jitter/
 ## Requirements
 
 - Python 3.10 or newer
-- No third-party packages are required for the current codebase
+- `mmh3` for fast hashing. Install it with:
+  `pip install mmh3`
 
 ## How to run
 
@@ -46,8 +47,3 @@ Run a quick synthetic smoke test:
 ```powershell
 python main.py --synthetic --num-pkts 200000
 ```
-
-
-
-
-

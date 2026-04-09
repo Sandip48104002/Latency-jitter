@@ -35,9 +35,10 @@ A pure-Python implementation of Bob Jenkins' lookup3 hashlittle2.
 """
 
 import array
+import mmh3
 
 # ── shared sketch parameters ──────────────────────────────────────────────────
-TOTAL_MEMORY_BYTES = 400 * 1024    # 400 KB hard budget
+TOTAL_MEMORY_BYTES = 700 * 1024    # 400 KB hard budget
 
 NUM_ROWS           = 4
 
@@ -68,47 +69,12 @@ BUCKETS_PER_ROW = BUCKETS_PER_ROW_FP
 
 # ── Bob Jenkins lookup3 hashlittle (32-bit) ───────────────────────────────────
 
-def _rot32(val: int, shift: int) -> int:
-    val &= 0xFFFFFFFF
-    return ((val << shift) | (val >> (32 - shift))) & 0xFFFFFFFF
-
-
-def bob_hash(data: bytes, seed: int = 0) -> int:
+def fast_hash(data: bytes, seed: int = 0) -> int:
     """
-    Pure-Python Bob Jenkins lookup3 hashlittle.
-    Returns a 32-bit unsigned integer.
+    Fast, seeded 32-bit hash using the mmh3 library (MurmurHash3).
+    Returns an unsigned 32-bit integer.
     """
-    MASK   = 0xFFFFFFFF
-    length = len(data)
-    a = b = c = (0xDEADBEEF + length + seed) & MASK
-
-    i = 0
-    while length > 12:
-        a = (a + int.from_bytes(data[i:i+4],    "little")) & MASK
-        b = (b + int.from_bytes(data[i+4:i+8],  "little")) & MASK
-        c = (c + int.from_bytes(data[i+8:i+12], "little")) & MASK
-        # mix
-        a = (_rot32(a ^ c,  4) - c) & MASK; c = _rot32(c,  5)
-        b = (_rot32(b ^ a,  6) - a) & MASK; a = _rot32(a, 11)
-        c = (_rot32(c ^ b,  8) - b) & MASK; b = _rot32(b, 13)
-        a = (_rot32(a ^ c, 14) - c) & MASK; c = _rot32(c, 11)
-        b = (_rot32(b ^ a, 11) - a) & MASK; a = _rot32(a, 25)
-        i      += 12
-        length -= 12
-
-    tail = data[i:] + b'\x00' * (12 - len(data[i:]))
-    a = (a + int.from_bytes(tail[0:4],  "little")) & MASK
-    b = (b + int.from_bytes(tail[4:8],  "little")) & MASK
-    c = (c + int.from_bytes(tail[8:12], "little")) & MASK
-    # final mix
-    c ^= b; c = (c - _rot32(b, 14)) & MASK
-    a ^= c; a = (a - _rot32(c, 11)) & MASK
-    b ^= a; b = (b - _rot32(a, 25)) & MASK
-    c ^= b; c = (c - _rot32(b, 16)) & MASK
-    a ^= c; a = (a - _rot32(c,  4)) & MASK
-    b ^= a; b = (b - _rot32(a, 14)) & MASK
-    c ^= b; c = (c - _rot32(b, 24)) & MASK
-    return c & MASK
+    return mmh3.hash(data, seed, signed=False)
 
 
 def flow_key_bytes(flow_id: str) -> bytes:
@@ -168,11 +134,11 @@ class JitterSketch:
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _bucket_index(self, key_bytes: bytes, row: int) -> int:
-        return bob_hash(key_bytes, seed=self.row_seeds[row]) % self.bpr
+        return fast_hash(key_bytes, seed=self.row_seeds[row]) % self.bpr
 
     def _fingerprint(self, key_bytes: bytes) -> int:
         """16-bit fingerprint; 0 is reserved for 'empty bucket'."""
-        h  = bob_hash(key_bytes, seed=self.fp_seed)
+        h  = fast_hash(key_bytes, seed=self.fp_seed)
         fp = (h >> 16) ^ (h & 0xFFFF)
         return fp if fp != 0 else 1
 
@@ -185,59 +151,90 @@ class JitterSketch:
         """
         Process one packet. Returns 1 if jitter detected, 0 otherwise.
 
-        Fingerprint match  → read EWMA → jitter check → update EWMA.
-        Empty bucket       → insert (seed EWMA = latency, count = 1).
-        Occupied (no match)→ evict if occupant count ≤ 2, else skip row.
+        A 2-pass approach is used:
+        1. HIT: Check all rows for a fingerprint match. If any exist, they are
+           all updated, and any empty candidate buckets are filled. A jitter
+           decision is made if at least one row matched.
+        2. MISS: If no row had a matching fingerprint, the packet is a miss.
+           The flow is inserted into an empty bucket if available. If all
+           candidate buckets are occupied, it evicts the one with the
+           lowest packet count across all rows. No jitter decision on a miss.
         """
         self.total_pkts += 1
         key   = flow_key_bytes(flow_id)
         fp    = self._fingerprint(key)
 
-        jitter_votes = 0
-        match_votes  = 0
+        indices = [self._bucket_index(key, row) for row in range(self.num_rows)]
+
+        # --- Pass 1: Find hits, empty slots, and collisions ---
+        hit_rows = []
+        empty_rows = []
+        collision_rows_with_counts = []
 
         for row in range(self.num_rows):
-            idx = self._bucket_index(key, row)
-
-            stored_fp    = self.fingerprints[row][idx]
-            stored_ewma  = self.ewma_vals[row][idx]
-            stored_count = self.pkt_counts[row][idx]
-
+            idx = indices[row]
+            stored_fp = self.fingerprints[row][idx]
             if stored_fp == fp:
-                # ── HIT ──────────────────────────────────────────────────────
-                match_votes += 1
+                hit_rows.append(row)
+            elif stored_fp == 0:
+                empty_rows.append(row)
+            else:
+                count = self.pkt_counts[row][idx]
+                collision_rows_with_counts.append((row, count))
+
+        # --- Process based on findings ---
+        if hit_rows:
+            # --- HIT PATH ---
+            self.hit_count += 1
+            jitter_votes = 0
+
+            # Update all matching rows
+            for row in hit_rows:
+                idx = indices[row]
+                stored_ewma = self.ewma_vals[row][idx]
+                stored_count = self.pkt_counts[row][idx]
+
                 if stored_count >= 1:
-                    # Jitter check against EWMA BEFORE updating it
                     if latency > self.k * stored_ewma or latency < stored_ewma / self.k:
                         jitter_votes += 1
-                # Update EWMA
+
                 new_ewma = latency if stored_count == 0 else self._ewma_step(stored_ewma, latency)
-                self.ewma_vals[row][idx]  = new_ewma
+                self.ewma_vals[row][idx] = new_ewma
                 self.pkt_counts[row][idx] = min(stored_count + 1, 65535)
 
-            elif stored_fp == 0:
-                # ── EMPTY – insert ────────────────────────────────────────────
+            # Fill all empty buckets
+            for row in empty_rows:
+                idx = indices[row]
                 self.fingerprints[row][idx] = fp
-                self.ewma_vals[row][idx]    = latency
-                self.pkt_counts[row][idx]   = 1
+                self.ewma_vals[row][idx] = latency
+                self.pkt_counts[row][idx] = 1
 
-            else:
-                # ── COLLISION – evict cold occupant ──────────────────────────
-                # Replace the existing entry only if it has been seen very few
-                # times (≤2), meaning it is likely a short-lived / dying flow.
-                if stored_count <= 2:
-                    self.fingerprints[row][idx] = fp
-                    self.ewma_vals[row][idx]    = latency
-                    self.pkt_counts[row][idx]   = 1
-                    self.evictions += 1
-                # else: keep existing entry; this packet is untracked in row
-
-        if match_votes > 0:
-            self.hit_count += 1
             return 1 if jitter_votes > 0 else 0
+
         else:
+            # --- MISS PATH ---
             self.miss_count += 1
-            return 0   # no match in any row → no decision possible
+
+            # Insert into an empty bucket if available (preferable to eviction)
+            if empty_rows:
+                row_to_fill = empty_rows[0]  # just pick the first one
+                idx = indices[row_to_fill]
+                self.fingerprints[row_to_fill][idx] = fp
+                self.ewma_vals[row_to_fill][idx] = latency
+                self.pkt_counts[row_to_fill][idx] = 1
+                return 0
+
+            # All candidate buckets are full. Evict the one with the lowest count.
+            if collision_rows_with_counts:
+                row_to_evict, _ = min(collision_rows_with_counts, key=lambda item: item[1])
+
+                idx = indices[row_to_evict]
+                self.fingerprints[row_to_evict][idx] = fp
+                self.ewma_vals[row_to_evict][idx] = latency
+                self.pkt_counts[row_to_evict][idx] = 1
+                self.evictions += 1
+
+            return 0
 
     def memory_bytes(self) -> int:
         return self.num_rows * self.bpr * _BUCKET_SIZE_FP
@@ -308,7 +305,7 @@ class JitterSketchNoFP:
     # ── helpers ───────────────────────────────────────────────────────────────
 
     def _bucket_index(self, key_bytes: bytes, row: int) -> int:
-        return bob_hash(key_bytes, seed=self.row_seeds[row]) % self.bpr
+        return fast_hash(key_bytes, seed=self.row_seeds[row]) % self.bpr
 
     def _ewma_step(self, current: float, sample: float) -> float:
         return self.alpha * sample + (1 - self.alpha) * current
